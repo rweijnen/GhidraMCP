@@ -42,13 +42,13 @@ def safe_get(endpoint: str, params: dict = None) -> list:
     except Exception as e:
         return [f"Request failed: {str(e)}"]
 
-def safe_post(endpoint: str, data: dict | str) -> str:
+def safe_post(endpoint: str, data: dict | str, timeout: int = 5) -> str:
     try:
         url = urljoin(ghidra_server_url, endpoint)
         if isinstance(data, dict):
-            response = requests.post(url, data=data, timeout=5)
+            response = requests.post(url, data=data, timeout=timeout)
         else:
-            response = requests.post(url, data=data.encode("utf-8"), timeout=5)
+            response = requests.post(url, data=data.encode("utf-8"), timeout=timeout)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.strip()
@@ -169,11 +169,19 @@ def get_current_function() -> str:
     return "\n".join(safe_get("get_current_function"))
 
 @mcp.tool()
-def list_functions() -> list:
+def list_functions(offset: int = 0, limit: int = 1000, filter: str = None) -> list:
     """
-    List all functions in the database.
+    List functions in the database with pagination and an optional name filter.
+
+    Args:
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of functions to return (default: 1000)
+        filter: Optional case-insensitive substring to match function names
     """
-    return safe_get("list_functions")
+    params = {"offset": offset, "limit": limit}
+    if filter:
+        params["filter"] = filter
+    return safe_get("list_functions", params)
 
 @mcp.tool()
 def decompile_function_by_address(address: str) -> str:
@@ -286,6 +294,316 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
     if filter:
         params["filter"] = filter
     return safe_get("strings", params)
+
+# ---------------------------------------------------------------------------
+# Firmware-RE tools (Priorities 1-5 from GHIDRA_MCP_WISHLIST)
+# ---------------------------------------------------------------------------
+
+# ----- Priority 1: code definition & analysis control -----
+
+@mcp.tool()
+def set_register_context(register: str, value: str, start: str, end: str = None) -> str:
+    """
+    Set a processor context register over an address range. This is the key to
+    decoding mode-switched ISAs before disassembly: PowerPC VLE (register "vle",
+    value "1"), ARM/Thumb ("TMode"), MIPS16, SH, etc.
+
+    Args:
+        register: Context register name (e.g. "vle", "TMode")
+        value: Value to set, decimal or 0x-prefixed hex (e.g. "1")
+        start: Start address of the range (e.g. "0x80000000")
+        end: End address of the range (inclusive); defaults to start if omitted
+    """
+    data = {"register": register, "value": value, "start": start}
+    if end:
+        data["end"] = end
+    return safe_post("set_register_context", data)
+
+@mcp.tool()
+def disassemble(address: str, length: int = None, end: str = None) -> str:
+    """
+    Force disassembly starting at an address (not limited to existing functions).
+    Provide either length (bytes) or end address to restrict the range; omit both
+    to follow flow from the start address.
+
+    Args:
+        address: Start address (e.g. "0x80000000")
+        length: Optional number of bytes to restrict disassembly to
+        end: Optional end address (inclusive) to restrict disassembly to
+    """
+    data = {"address": address}
+    if length is not None:
+        data["length"] = length
+    if end:
+        data["end"] = end
+    return safe_post("disassemble", data, timeout=60)
+
+@mcp.tool()
+def create_function(address: str, name: str = None) -> str:
+    """
+    Create a function at the given entry-point address, optionally naming it.
+
+    Args:
+        address: Function entry-point address
+        name: Optional name for the new function
+    """
+    data = {"address": address}
+    if name:
+        data["name"] = name
+    return safe_post("create_function", data, timeout=30)
+
+@mcp.tool()
+def delete_function(address: str) -> str:
+    """
+    Delete the function at the given address.
+    """
+    return safe_post("delete_function", {"address": address})
+
+@mcp.tool()
+def clear_code(start: str, end: str = None) -> str:
+    """
+    Clear code units (instructions/data) over an address range, reverting to
+    undefined bytes. Use before re-disassembling after fixing context registers.
+
+    Args:
+        start: Start address
+        end: End address (inclusive); defaults to start if omitted
+    """
+    data = {"start": start}
+    if end:
+        data["end"] = end
+    return safe_post("clear_code", data, timeout=30)
+
+@mcp.tool()
+def auto_analyze(aggressive: bool = False) -> str:
+    """
+    Run Ghidra auto-analysis on the current program and wait for completion.
+    Useful for turning a freshly disassembled raw blob into functions.
+
+    Note: on a headerless blob with no entry point, plain analysis finds nothing
+    until code is seeded. Either force disassembly first (disassemble /
+    create_function) or pass aggressive=True.
+
+    Args:
+        aggressive: Enable the Aggressive Instruction Finder analyzer, which
+            digs code out of undefined bytes. Recommended for raw blobs; it can
+            create false-positive code, so verify the results.
+    """
+    return safe_post("auto_analyze", {"aggressive": "true" if aggressive else "false"}, timeout=600)
+
+@mcp.tool()
+def run_analysis(aggressive: bool = False) -> str:
+    """
+    Alias for auto_analyze: run Ghidra auto-analysis and wait for completion.
+
+    Args:
+        aggressive: Enable the Aggressive Instruction Finder analyzer (see
+            auto_analyze).
+    """
+    return safe_post("run_analysis", {"aggressive": "true" if aggressive else "false"}, timeout=600)
+
+@mcp.tool()
+def analysis_status() -> str:
+    """
+    Report whether auto-analysis is running, plus current function and
+    instruction counts.
+    """
+    return "\n".join(safe_get("analysis_status"))
+
+@mcp.tool()
+def define_data(address: str, type: str) -> str:
+    """
+    Define a typed data item at an address (carve a data table out of code).
+
+    Args:
+        address: Address to define data at
+        type: Data type name (e.g. "dword", "char", "pointer")
+    """
+    return safe_post("define_data", {"address": address, "type": type})
+
+# ----- Priority 2: program setup / import & sanity -----
+
+@mcp.tool()
+def import_program(path: str, language_id: str, base_address: str = None) -> str:
+    """
+    Import a raw/headerless binary into the active project with an explicit
+    language, then open it. Lets an agent create the program instead of only
+    attaching to one opened in the GUI.
+
+    Args:
+        path: Absolute path to the binary file on the Ghidra host
+        language_id: Ghidra LanguageID (e.g. "PowerPC:BE:32:MPC8270" or a VLE
+            variant). Use list_languages to discover valid IDs.
+        base_address: Optional image base address (e.g. "0x80000000")
+    """
+    data = {"path": path, "language_id": language_id}
+    if base_address:
+        data["base_address"] = base_address
+    return safe_post("import_program", data, timeout=600)
+
+@mcp.tool()
+def list_project_files(filter: str = None, offset: int = 0, limit: int = 200) -> list:
+    """
+    List programs and other files in the current Ghidra project (project path
+    and content type), optionally filtered. Use to discover what open_program
+    can open.
+
+    Note: requires a CodeBrowser tool to be open (the MCP server runs inside it).
+
+    Args:
+        filter: Optional case-insensitive substring to match
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of entries to return (default: 200)
+    """
+    params = {"offset": offset, "limit": limit}
+    if filter:
+        params["filter"] = filter
+    return safe_get("list_project_files", params)
+
+@mcp.tool()
+def open_program(path: str) -> str:
+    """
+    Open a program from the current Ghidra project by its project path and make
+    it the current program. Lets an agent switch between programs without the GUI.
+
+    Note: a CodeBrowser tool must already be open (the MCP server runs inside
+    it); this cannot open the first CodeBrowser itself.
+
+    Args:
+        path: Project path of the program, e.g. "/mcu_image.bin.0"
+            (use list_project_files to discover paths)
+    """
+    return safe_post("open_program", {"path": path}, timeout=120)
+
+@mcp.tool()
+def list_languages(filter: str = None, offset: int = 0, limit: int = 100) -> list:
+    """
+    List available Ghidra LanguageIDs (processor/endian/size/description),
+    optionally filtered. Parity with IDA's processor/device listing.
+
+    Args:
+        filter: Optional case-insensitive substring to match
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of entries to return (default: 100)
+    """
+    params = {"offset": offset, "limit": limit}
+    if filter:
+        params["filter"] = filter
+    return safe_get("list_languages", params)
+
+@mcp.tool()
+def program_info(verify: bool = False) -> str:
+    """
+    Return a summary of the current program: language, endianness, image base,
+    segment map, and function/instruction counts. With verify=True, also test-
+    decode a few instructions at the image base to catch a wrong-arch database.
+
+    Args:
+        verify: If True, include a decode sanity check at the image base
+    """
+    return "\n".join(safe_get("program_info", {"verify": "true" if verify else "false"}))
+
+# ----- Priority 3: search & raw bytes -----
+
+@mcp.tool()
+def read_bytes(address: str, length: int = 16) -> str:
+    """
+    Read raw bytes at an address and return them as a hex string.
+
+    Args:
+        address: Address to read from
+        length: Number of bytes to read (1-4096, default: 16)
+    """
+    return "\n".join(safe_get("read_bytes", {"address": address, "length": length}))
+
+@mcp.tool()
+def search_bytes(pattern: str, mask: str = None, limit: int = 100) -> list:
+    """
+    Search program memory for a byte pattern, returning matching addresses.
+    Useful for locating opcode/immediate/signature patterns such as command
+    dispatch tables.
+
+    Args:
+        pattern: Hex byte pattern (spaces allowed, e.g. "48 8b 05")
+        mask: Optional hex mask of equal length (0xFF = must match, 0x00 = wildcard)
+        limit: Maximum number of matches to return (default: 100)
+    """
+    params = {"pattern": pattern, "limit": limit}
+    if mask:
+        params["mask"] = mask
+    return safe_get("search_bytes", params)
+
+@mcp.tool()
+def get_string(address: str) -> str:
+    """
+    Read the string at a specific address (point lookup), falling back to a
+    null-terminated read if no string is defined there.
+    """
+    return "\n".join(safe_get("get_string", {"address": address}))
+
+# ----- Priority 4: annotation parity & scale -----
+
+@mcp.tool()
+def decompile_many(addresses: str) -> str:
+    """
+    Decompile several functions in one call. Faster than decompiling leads one
+    at a time.
+
+    Args:
+        addresses: Addresses separated by commas or whitespace
+    """
+    return safe_post("decompile_many", {"addresses": addresses}, timeout=120)
+
+@mcp.tool()
+def set_bookmark(address: str, category: str = "MCP", comment: str = "") -> str:
+    """
+    Set a Note bookmark at an address, so agents can tag leads (e.g. a
+    "[LEAD:<grade>]" convention) and filter them later.
+
+    Args:
+        address: Address to bookmark
+        category: Bookmark category (default: "MCP")
+        comment: Bookmark comment/note text
+    """
+    return safe_post("set_bookmark", {"address": address, "category": category, "comment": comment})
+
+@mcp.tool()
+def list_bookmarks(filter: str = None, offset: int = 0, limit: int = 100) -> list:
+    """
+    List bookmarks (address, type, category, comment), optionally filtered.
+
+    Args:
+        filter: Optional case-insensitive substring to match
+        offset: Pagination offset (default: 0)
+        limit: Maximum number of bookmarks to return (default: 100)
+    """
+    params = {"offset": offset, "limit": limit}
+    if filter:
+        params["filter"] = filter
+    return safe_get("list_bookmarks", params)
+
+@mcp.tool()
+def define_struct(c_declaration: str) -> str:
+    """
+    Parse a C declaration (e.g. a struct) and add it to the program's data type
+    manager. Parity with IDA's type-declaration support for recovered wire
+    structs.
+
+    Args:
+        c_declaration: A C type declaration, e.g.
+            "struct Msg { int id; char name[16]; void *handler; };"
+    """
+    return safe_post("define_struct", {"c_declaration": c_declaration})
+
+# ----- Priority 5: persistence -----
+
+@mcp.tool()
+def save_program() -> str:
+    """
+    Save the current program to its Ghidra project, persisting renames,
+    comments, types, and bookmarks without using the GUI.
+    """
+    return safe_post("save_program", {}, timeout=120)
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")

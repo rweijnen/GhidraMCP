@@ -45,6 +45,40 @@ import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
 import ghidra.framework.options.Options;
 
+// --- Additional imports for firmware-RE tools ---
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.address.AddressSetView;
+import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.Language;
+import ghidra.program.model.lang.LanguageID;
+import ghidra.program.model.lang.LanguageService;
+import ghidra.program.model.lang.LanguageDescription;
+import ghidra.program.model.lang.CompilerSpec;
+import ghidra.program.util.DefaultLanguageService;
+import ghidra.app.cmd.register.SetRegisterCmd;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
+import ghidra.app.cmd.function.CreateFunctionCmd;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.listing.BookmarkManager;
+import ghidra.program.model.listing.Bookmark;
+import ghidra.program.model.listing.BookmarkType;
+import ghidra.app.util.PseudoInstruction;
+import ghidra.program.model.data.DataUtilities;
+import ghidra.program.model.data.DataUtilities.ClearDataMode;
+import ghidra.program.model.data.DataTypeConflictHandler;
+import ghidra.program.model.data.StringDataInstance;
+import ghidra.app.util.cparser.C.CParser;
+import ghidra.app.util.importer.AutoImporter;
+import ghidra.app.util.importer.MessageLog;
+import ghidra.app.util.opinion.Loaded;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
+import ghidra.framework.model.Project;
+import ghidra.framework.model.DomainFile;
+import ghidra.framework.model.DomainFolder;
+import java.math.BigInteger;
+import java.io.File;
+
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
@@ -208,7 +242,11 @@ public class GhidraMCPPlugin extends Plugin {
         });
 
         server.createContext("/list_functions", exchange -> {
-            sendResponse(exchange, listFunctions());
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit  = parseIntOrDefault(qparams.get("limit"),  1000);
+            String filter = qparams.get("filter");
+            sendResponse(exchange, listFunctions(offset, limit, filter));
         });
 
         server.createContext("/decompile_function", exchange -> {
@@ -339,6 +377,138 @@ public class GhidraMCPPlugin extends Plugin {
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String filter = qparams.get("filter");
             sendResponse(exchange, listDefinedStrings(offset, limit, filter));
+        });
+
+        // ------------------------------------------------------------------
+        // Firmware-RE tools: code definition, analysis, import, search, etc.
+        // ------------------------------------------------------------------
+
+        // Priority 1 -- code definition & analysis control
+        server.createContext("/set_register_context", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, setRegisterContext(
+                params.get("register"), params.get("value"),
+                params.get("start"), params.get("end")));
+        });
+
+        server.createContext("/disassemble", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, disassembleRange(params.get("address"), params.get("length"), params.get("end")));
+        });
+
+        server.createContext("/create_function", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, createFunctionAt(params.get("address"), params.get("name")));
+        });
+
+        server.createContext("/delete_function", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, deleteFunctionAt(params.get("address")));
+        });
+
+        server.createContext("/clear_code", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, clearCodeRange(params.get("start"), params.get("end")));
+        });
+
+        server.createContext("/auto_analyze", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            boolean aggressive = "true".equalsIgnoreCase(params.get("aggressive"));
+            sendResponse(exchange, runAutoAnalysis(aggressive));
+        });
+
+        server.createContext("/run_analysis", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            boolean aggressive = "true".equalsIgnoreCase(params.get("aggressive"));
+            sendResponse(exchange, runAutoAnalysis(aggressive));
+        });
+
+        server.createContext("/analysis_status", exchange -> {
+            sendResponse(exchange, analysisStatus());
+        });
+
+        server.createContext("/define_data", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, defineDataAt(params.get("address"), params.get("type")));
+        });
+
+        // Priority 2 -- program setup / import & sanity
+        server.createContext("/import_program", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, importProgram(
+                params.get("path"), params.get("language_id"), params.get("base_address")));
+        });
+
+        server.createContext("/open_program", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, openProgramFromProject(params.get("path")));
+        });
+
+        server.createContext("/list_project_files", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit  = parseIntOrDefault(qparams.get("limit"),  200);
+            sendResponse(exchange, listProjectFiles(qparams.get("filter"), offset, limit));
+        });
+
+        server.createContext("/list_languages", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit  = parseIntOrDefault(qparams.get("limit"),  100);
+            sendResponse(exchange, listLanguages(qparams.get("filter"), offset, limit));
+        });
+
+        server.createContext("/program_info", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            boolean verify = "true".equalsIgnoreCase(qparams.get("verify"));
+            sendResponse(exchange, programInfo(verify));
+        });
+
+        // Priority 3 -- search & raw bytes
+        server.createContext("/read_bytes", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int length = parseIntOrDefault(qparams.get("length"), 16);
+            sendResponse(exchange, readBytes(qparams.get("address"), length));
+        });
+
+        server.createContext("/search_bytes", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, searchBytes(qparams.get("pattern"), qparams.get("mask"), limit));
+        });
+
+        server.createContext("/get_string", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendResponse(exchange, getStringAt(qparams.get("address")));
+        });
+
+        // Priority 4 -- annotation parity & scale
+        server.createContext("/decompile_many", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, decompileMany(params.get("addresses")));
+        });
+
+        server.createContext("/set_bookmark", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, setBookmark(
+                params.get("address"), params.get("category"), params.get("comment")));
+        });
+
+        server.createContext("/list_bookmarks", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            int offset = parseIntOrDefault(qparams.get("offset"), 0);
+            int limit  = parseIntOrDefault(qparams.get("limit"),  100);
+            sendResponse(exchange, listBookmarks(qparams.get("filter"), offset, limit));
+        });
+
+        server.createContext("/define_struct", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, defineStruct(params.get("c_declaration")));
+        });
+
+        // Priority 5 -- persistence
+        server.createContext("/save_program", exchange -> {
+            sendResponse(exchange, saveProgram());
         });
 
         server.setExecutor(null);
@@ -763,20 +933,22 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
-     * List all functions in the database
+     * List functions in the database, with pagination and optional name filter.
      */
-    private String listFunctions() {
+    private String listFunctions(int offset, int limit, String filter) {
         Program program = getCurrentProgram();
         if (program == null) return "No program loaded";
 
-        StringBuilder result = new StringBuilder();
+        List<String> lines = new ArrayList<>();
         for (Function func : program.getFunctionManager().getFunctions(true)) {
-            result.append(String.format("%s at %s\n", 
-                func.getName(), 
-                func.getEntryPoint()));
+            String name = func.getName();
+            if (filter != null && !filter.isEmpty()
+                    && !name.toLowerCase().contains(filter.toLowerCase())) {
+                continue;
+            }
+            lines.add(String.format("%s at %s", name, func.getEntryPoint()));
         }
-
-        return result.toString();
+        return paginateList(lines, offset, limit);
     }
 
     /**
@@ -1525,6 +1697,608 @@ public class GhidraMCPPlugin extends Plugin {
             }
         }
         return null;
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Firmware-RE tools implementation (Priorities 1-5 from GHIDRA_MCP_WISHLIST)
+    // ----------------------------------------------------------------------------------
+
+    /** Functional task run inside a program transaction on the Swing thread. */
+    private interface TxTask {
+        void run() throws Exception;
+    }
+
+    /**
+     * Run a task inside a program transaction on the Swing thread.
+     * @return null on success, or an "Error: ..." string on failure.
+     */
+    private String runInTransaction(Program program, String name, TxTask task) {
+        final StringBuilder err = new StringBuilder();
+        final AtomicBoolean ok = new AtomicBoolean(false);
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction(name);
+                try {
+                    task.run();
+                    ok.set(true);
+                } catch (Exception e) {
+                    err.append(e.getMessage() != null ? e.getMessage() : e.toString());
+                    Msg.error(this, name + " failed", e);
+                } finally {
+                    program.endTransaction(tx, ok.get());
+                }
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            err.append(e.getMessage());
+            Msg.error(this, name + " failed on Swing thread", e);
+        }
+        return ok.get() ? null : ("Error: " + err);
+    }
+
+    /** Parse an address string, tolerating an optional 0x prefix. */
+    private Address parseAddress(Program program, String s) {
+        if (s == null || s.isEmpty()) return null;
+        s = s.trim();
+        if (s.toLowerCase().startsWith("0x")) s = s.substring(2);
+        try {
+            return program.getAddressFactory().getAddress(s);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Parse a BigInteger, tolerating an optional 0x (hex) prefix. */
+    private BigInteger parseBigInteger(String s) {
+        s = s.trim();
+        if (s.toLowerCase().startsWith("0x")) return new BigInteger(s.substring(2), 16);
+        return new BigInteger(s);
+    }
+
+    /** Convert a hex string (spaces allowed) to a byte array. */
+    private byte[] hexToBytes(String hex) {
+        String cleaned = hex.replaceAll("\\s+", "");
+        if (cleaned.length() % 2 != 0) throw new IllegalArgumentException("odd hex length");
+        byte[] out = new byte[cleaned.length() / 2];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = (byte) Integer.parseInt(cleaned.substring(i * 2, i * 2 + 2), 16);
+        }
+        return out;
+    }
+
+    // ----- Priority 1: code definition & analysis control -----
+
+    private String setRegisterContext(String regName, String valueStr, String startStr, String endStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (regName == null || regName.isEmpty()) return "Error: register is required";
+        if (valueStr == null || valueStr.isEmpty()) return "Error: value is required";
+        Address start = parseAddress(program, startStr);
+        Address end = (endStr == null || endStr.isEmpty()) ? start : parseAddress(program, endStr);
+        if (start == null || end == null) return "Error: invalid start/end address";
+        Register reg = program.getRegister(regName);
+        if (reg == null) return "Error: register not found: " + regName;
+        final BigInteger value;
+        try {
+            value = parseBigInteger(valueStr);
+        } catch (Exception e) {
+            return "Error: invalid value: " + valueStr;
+        }
+        final Address s = start, e = end;
+        final Register r = reg;
+        String err = runInTransaction(program, "Set register context", () -> {
+            SetRegisterCmd cmd = new SetRegisterCmd(r, s, e, value);
+            if (!cmd.applyTo(program)) throw new Exception(cmd.getStatusMsg());
+        });
+        return err != null ? err
+            : String.format("Set %s=0x%s over %s - %s", regName, value.toString(16), start, end);
+    }
+
+    private String disassembleRange(String addressStr, String lengthStr, String endStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        Address start = parseAddress(program, addressStr);
+        if (start == null) return "Error: invalid address";
+        Address end = null;
+        if (endStr != null && !endStr.isEmpty()) {
+            end = parseAddress(program, endStr);
+        } else if (lengthStr != null && !lengthStr.isEmpty()) {
+            try { end = start.add(Long.parseLong(lengthStr) - 1); } catch (Exception ignore) {}
+        }
+        final AddressSetView restricted = (end != null) ? new AddressSet(start, end) : null;
+        final Address s = start;
+        String err = runInTransaction(program, "Disassemble", () -> {
+            DisassembleCommand cmd = new DisassembleCommand(s, restricted, true);
+            if (!cmd.applyTo(program)) throw new Exception(cmd.getStatusMsg());
+        });
+        if (err != null) return err;
+        Address to = (end != null) ? end : program.getMaxAddress();
+        int count = 0;
+        InstructionIterator it = program.getListing().getInstructions(start, true);
+        while (it.hasNext()) {
+            Instruction ins = it.next();
+            if (ins.getAddress().compareTo(to) > 0) break;
+            count++;
+        }
+        return String.format("Disassembled from %s; %d instructions present in range", start, count);
+    }
+
+    private String createFunctionAt(String addressStr, String name) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        Address addr = parseAddress(program, addressStr);
+        if (addr == null) return "Error: invalid address";
+        final Address a = addr;
+        final String[] created = {null};
+        String err = runInTransaction(program, "Create function", () -> {
+            CreateFunctionCmd cmd = new CreateFunctionCmd(a);
+            if (!cmd.applyTo(program)) throw new Exception(cmd.getStatusMsg());
+            Function f = program.getFunctionManager().getFunctionAt(a);
+            if (f == null) throw new Exception("function not created");
+            if (name != null && !name.isEmpty()) f.setName(name, SourceType.USER_DEFINED);
+            created[0] = f.getName();
+        });
+        return err != null ? err : "Created function " + created[0] + " at " + addr;
+    }
+
+    private String deleteFunctionAt(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        Address addr = parseAddress(program, addressStr);
+        if (addr == null) return "Error: invalid address";
+        final Address a = addr;
+        final boolean[] removed = {false};
+        String err = runInTransaction(program, "Delete function", () -> {
+            removed[0] = program.getFunctionManager().removeFunction(a);
+        });
+        if (err != null) return err;
+        return removed[0] ? "Deleted function at " + addr : "No function at " + addr;
+    }
+
+    private String clearCodeRange(String startStr, String endStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        Address start = parseAddress(program, startStr);
+        Address end = (endStr == null || endStr.isEmpty()) ? start : parseAddress(program, endStr);
+        if (start == null || end == null) return "Error: invalid start/end address";
+        final Address s = start, e = end;
+        String err = runInTransaction(program, "Clear code", () -> {
+            program.getListing().clearCodeUnits(s, e, false);
+        });
+        return err != null ? err : "Cleared code units " + start + " - " + end;
+    }
+
+    private String runAutoAnalysis(boolean aggressive) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        try {
+            if (aggressive) {
+                int txOpt = program.startTransaction("Enable aggressive analysis");
+                try {
+                    Options opts = program.getOptions(Program.ANALYSIS_PROPERTIES);
+                    // Aggressive Instruction Finder digs code out of undefined bytes on
+                    // raw blobs; disabled by default. Enable the ARM variant too so the
+                    // flag works regardless of processor.
+                    opts.setBoolean("Aggressive Instruction Finder", true);
+                    opts.setBoolean("ARM Aggressive Instruction Finder", true);
+                } catch (Exception e) {
+                    Msg.warn(this, "Could not enable aggressive analyzer: " + e.getMessage());
+                } finally {
+                    program.endTransaction(txOpt, true);
+                }
+            }
+            AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(program);
+            mgr.reAnalyzeAll(null);
+            int tx = program.startTransaction("Auto-analysis");
+            try {
+                mgr.startAnalysis(new ConsoleTaskMonitor());
+            } finally {
+                program.endTransaction(tx, true);
+            }
+            return String.format("Auto-analysis complete%s. Functions: %d",
+                aggressive ? " (aggressive)" : "",
+                program.getFunctionManager().getFunctionCount());
+        } catch (Exception e) {
+            return "Error during analysis: " + e.getMessage();
+        }
+    }
+
+    private String analysisStatus() {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(program);
+        return String.format("analyzing=%s\nfunctions=%d\ninstructions=%d",
+            mgr.isAnalyzing(),
+            program.getFunctionManager().getFunctionCount(),
+            program.getListing().getNumInstructions());
+    }
+
+    private String defineDataAt(String addressStr, String typeName) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (typeName == null || typeName.isEmpty()) return "Error: type is required";
+        Address addr = parseAddress(program, addressStr);
+        if (addr == null) return "Error: invalid address";
+        DataType dt = resolveDataType(program.getDataTypeManager(), typeName);
+        if (dt == null) return "Error: could not resolve type " + typeName;
+        final Address a = addr;
+        final DataType d = dt;
+        final String[] res = {null};
+        String err = runInTransaction(program, "Define data", () -> {
+            Data data = DataUtilities.createData(program, a, d, d.getLength(), false,
+                ClearDataMode.CLEAR_ALL_CONFLICT_DATA);
+            res[0] = data.getDataType().getName();
+        });
+        return err != null ? err : "Defined " + res[0] + " at " + addr;
+    }
+
+    // ----- Priority 2: program setup / import & sanity -----
+
+    private String importProgram(String path, String languageId, String baseAddress) {
+        if (path == null || path.isEmpty()) return "Error: path is required";
+        if (languageId == null || languageId.isEmpty()) return "Error: language_id is required";
+        File f = new File(path);
+        if (!f.exists()) return "Error: file not found: " + path;
+        Project project = tool.getProject();
+        if (project == null) return "Error: no active project";
+        try {
+            LanguageService ls = DefaultLanguageService.getLanguageService();
+            Language lang;
+            try {
+                lang = ls.getLanguage(new LanguageID(languageId));
+            } catch (Exception e) {
+                return "Error: unknown language_id: " + languageId;
+            }
+            CompilerSpec cs = lang.getDefaultCompilerSpec();
+            MessageLog log = new MessageLog();
+            Loaded<Program> loaded = AutoImporter.importAsBinary(
+                f, project, "/", lang, cs, this, log, new ConsoleTaskMonitor());
+            StringBuilder summary = new StringBuilder();
+            try {
+                Program p = loaded.getDomainObject();
+                if (baseAddress != null && !baseAddress.isEmpty()) {
+                    int tx = p.startTransaction("Set image base");
+                    boolean okBase = false;
+                    try {
+                        Address base = parseAddress(p, baseAddress);
+                        if (base != null) {
+                            p.setImageBase(base, true);
+                            okBase = true;
+                        }
+                    } finally {
+                        p.endTransaction(tx, okBase);
+                    }
+                }
+                summary.append("Imported ").append(f.getName())
+                       .append("\nlanguage=").append(p.getLanguageID())
+                       .append("\nimageBase=").append(p.getImageBase());
+                loaded.save(new ConsoleTaskMonitor());
+                DomainFile df = loaded.getSavedDomainFile();
+                summary.append("\nsavedAs=").append(df.getPathname());
+                ProgramManager pm = tool.getService(ProgramManager.class);
+                if (pm != null) {
+                    final DomainFile toOpen = df;
+                    SwingUtilities.invokeLater(() -> pm.openProgram(toOpen));
+                    summary.append("\nopened=true");
+                }
+            } finally {
+                loaded.close();
+            }
+            String logStr = log.toString();
+            if (logStr != null && !logStr.isEmpty()) summary.append("\n-- log --\n").append(logStr);
+            return summary.toString();
+        } catch (Exception e) {
+            return "Error importing program: " + e.getMessage();
+        }
+    }
+
+    private String openProgramFromProject(String path) {
+        if (path == null || path.isEmpty()) return "Error: path is required";
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm == null) return "Error: no ProgramManager (open a CodeBrowser tool first)";
+        Project project = tool.getProject();
+        if (project == null) return "Error: no active project";
+        DomainFile df = project.getProjectData().getFile(path);
+        if (df == null) return "Error: no project file at " + path;
+        final DomainFile toOpen = df;
+        final String[] res = {null};
+        try {
+            SwingUtilities.invokeAndWait(() -> {
+                Program p = pm.openProgram(toOpen, DomainFile.DEFAULT_VERSION, ProgramManager.OPEN_CURRENT);
+                if (p != null) res[0] = p.getName();
+            });
+        } catch (InterruptedException | InvocationTargetException e) {
+            return "Error opening program: " + e.getMessage();
+        }
+        return res[0] != null ? "Opened and made current: " + path : "Failed to open " + path;
+    }
+
+    private String listProjectFiles(String filter, int offset, int limit) {
+        Project project = tool.getProject();
+        if (project == null) return "No active project";
+        List<String> lines = new ArrayList<>();
+        collectProjectFiles(project.getProjectData().getRootFolder(), lines);
+        if (filter != null && !filter.isEmpty()) {
+            List<String> filtered = new ArrayList<>();
+            for (String l : lines) {
+                if (l.toLowerCase().contains(filter.toLowerCase())) filtered.add(l);
+            }
+            lines = filtered;
+        }
+        Collections.sort(lines);
+        return paginateList(lines, offset, limit);
+    }
+
+    private void collectProjectFiles(DomainFolder folder, List<String> out) {
+        if (folder == null) return;
+        for (DomainFile f : folder.getFiles()) {
+            out.add(f.getPathname() + " (" + f.getContentType() + ")");
+        }
+        for (DomainFolder sub : folder.getFolders()) {
+            collectProjectFiles(sub, out);
+        }
+    }
+
+    private String listLanguages(String filter, int offset, int limit) {
+        LanguageService ls = DefaultLanguageService.getLanguageService();
+        List<String> lines = new ArrayList<>();
+        for (LanguageDescription d : ls.getLanguageDescriptions(false)) {
+            String line = String.format("%s (%s/%s/%d) %s",
+                d.getLanguageID().getIdAsString(),
+                d.getProcessor(), d.getEndian(), d.getSize(), d.getDescription());
+            if (filter == null || filter.isEmpty()
+                    || line.toLowerCase().contains(filter.toLowerCase())) {
+                lines.add(line);
+            }
+        }
+        Collections.sort(lines);
+        return paginateList(lines, offset, limit);
+    }
+
+    private String programInfo(boolean verify) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        Language lang = program.getLanguage();
+        StringBuilder sb = new StringBuilder();
+        sb.append("name=").append(program.getName()).append("\n");
+        sb.append("languageID=").append(program.getLanguageID()).append("\n");
+        sb.append("processor=").append(lang.getProcessor()).append("\n");
+        sb.append("endian=").append(lang.isBigEndian() ? "big" : "little").append("\n");
+        sb.append("addressSize=").append(lang.getLanguageDescription().getSize()).append("\n");
+        sb.append("imageBase=").append(program.getImageBase()).append("\n");
+        sb.append("functions=").append(program.getFunctionManager().getFunctionCount()).append("\n");
+        sb.append("instructions=").append(program.getListing().getNumInstructions()).append("\n");
+        sb.append("-- segments --\n");
+        for (MemoryBlock b : program.getMemory().getBlocks()) {
+            sb.append(String.format("%s: %s - %s  %s%s%s\n",
+                b.getName(), b.getStart(), b.getEnd(),
+                b.isRead() ? "r" : "-", b.isWrite() ? "w" : "-", b.isExecute() ? "x" : "-"));
+        }
+        if (verify) {
+            // Pick a meaningful address to decode-check. The image base is often
+            // unmapped (e.g. 0) on raw imports, so prefer the first real
+            // instruction (analyzed programs), then the first executable block
+            // (raw blobs), and only then fall back to the minimum address.
+            Address checkAddr = null;
+            InstructionIterator iit = program.getListing().getInstructions(true);
+            if (iit.hasNext()) {
+                checkAddr = iit.next().getAddress();
+            }
+            if (checkAddr == null) {
+                for (MemoryBlock b : program.getMemory().getBlocks()) {
+                    if (b.isExecute() && b.isInitialized()) {
+                        checkAddr = b.getStart();
+                        break;
+                    }
+                }
+            }
+            if (checkAddr == null) checkAddr = program.getMinAddress();
+            sb.append("-- decode check @ ").append(checkAddr).append(" --\n");
+            sb.append(decodeCheck(program, checkAddr, 8));
+        }
+        return sb.toString();
+    }
+
+    /** Test-decode a few instructions at an address without modifying the program. */
+    private String decodeCheck(Program program, Address addr, int count) {
+        if (addr == null) return "no address";
+        StringBuilder sb = new StringBuilder();
+        try {
+            PseudoDisassembler pdis = new PseudoDisassembler(program);
+            Address cur = addr;
+            for (int i = 0; i < count && cur != null; i++) {
+                try {
+                    PseudoInstruction ins = pdis.disassemble(cur);
+                    if (ins == null) { sb.append(cur).append(": <undecodable>\n"); break; }
+                    sb.append(cur).append(": ").append(ins.toString()).append("\n");
+                    cur = cur.add(ins.getLength());
+                } catch (Exception e) {
+                    sb.append(cur).append(": <decode error: ").append(e.getMessage()).append(">\n");
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            return "decode check failed: " + e.getMessage();
+        }
+        return sb.toString();
+    }
+
+    // ----- Priority 3: search & raw bytes -----
+
+    private String readBytes(String addressStr, int length) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        Address addr = parseAddress(program, addressStr);
+        if (addr == null) return "Error: invalid address";
+        if (length <= 0 || length > 4096) return "Error: length must be 1-4096";
+        try {
+            byte[] buf = new byte[length];
+            int n = program.getMemory().getBytes(addr, buf);
+            StringBuilder hex = new StringBuilder();
+            for (int i = 0; i < n; i++) hex.append(String.format("%02x", buf[i] & 0xFF));
+            return addr + ": " + hex;
+        } catch (MemoryAccessException e) {
+            return "Error reading memory: " + e.getMessage();
+        }
+    }
+
+    private String searchBytes(String patternHex, String maskHex, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (patternHex == null || patternHex.isEmpty()) return "Error: pattern is required";
+        byte[] pattern;
+        byte[] mask = null;
+        try {
+            pattern = hexToBytes(patternHex);
+        } catch (Exception e) {
+            return "Error: invalid pattern hex";
+        }
+        if (maskHex != null && !maskHex.isEmpty()) {
+            try {
+                mask = hexToBytes(maskHex);
+            } catch (Exception e) {
+                return "Error: invalid mask hex";
+            }
+            if (mask.length != pattern.length) return "Error: mask length must equal pattern length";
+        }
+        Memory mem = program.getMemory();
+        TaskMonitor monitor = new ConsoleTaskMonitor();
+        List<String> hits = new ArrayList<>();
+        Address cur = program.getMinAddress();
+        while (cur != null && hits.size() < limit) {
+            Address found = mem.findBytes(cur, pattern, mask, true, monitor);
+            if (found == null) break;
+            hits.add(found.toString());
+            try {
+                cur = found.add(1);
+            } catch (Exception e) {
+                break;
+            }
+        }
+        if (hits.isEmpty()) return "No matches";
+        return String.join("\n", hits);
+    }
+
+    private String getStringAt(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        Address addr = parseAddress(program, addressStr);
+        if (addr == null) return "Error: invalid address";
+        Data data = program.getListing().getDataContaining(addr);
+        if (data != null && isStringData(data)) {
+            StringDataInstance sdi = StringDataInstance.getStringDataInstance(data);
+            String v = sdi.getStringValue();
+            if (v != null) return addr + ": \"" + escapeString(v) + "\"";
+        }
+        // Fallback: read a null-terminated string directly from memory.
+        try {
+            byte[] buf = new byte[256];
+            int n = program.getMemory().getBytes(addr, buf);
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < n; i++) {
+                byte b = buf[i];
+                if (b == 0) break;
+                if (b >= 32 && b < 127) sb.append((char) b);
+                else sb.append(String.format("\\x%02x", b & 0xFF));
+            }
+            if (sb.length() == 0) return "No string at " + addr;
+            return addr + ": \"" + sb + "\"";
+        } catch (Exception e) {
+            return "Error reading string: " + e.getMessage();
+        }
+    }
+
+    // ----- Priority 4: annotation parity & scale -----
+
+    private String decompileMany(String addresses) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addresses == null || addresses.isEmpty()) return "Error: addresses is required";
+        String[] parts = addresses.split("[,\\s]+");
+        StringBuilder sb = new StringBuilder();
+        DecompInterface decomp = new DecompInterface();
+        decomp.openProgram(program);
+        try {
+            for (String part : parts) {
+                if (part.isEmpty()) continue;
+                sb.append("==== ").append(part).append(" ====\n");
+                Address addr = parseAddress(program, part);
+                if (addr == null) { sb.append("invalid address\n\n"); continue; }
+                Function func = getFunctionForAddress(program, addr);
+                if (func == null) { sb.append("no function at or containing address\n\n"); continue; }
+                DecompileResults res = decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
+                if (res != null && res.decompileCompleted()) {
+                    sb.append(res.getDecompiledFunction().getC());
+                } else {
+                    sb.append("decompilation failed");
+                }
+                sb.append("\n\n");
+            }
+        } finally {
+            decomp.dispose();
+        }
+        return sb.toString();
+    }
+
+    private String setBookmark(String addressStr, String category, String comment) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        Address addr = parseAddress(program, addressStr);
+        if (addr == null) return "Error: invalid address";
+        final Address a = addr;
+        final String cat = (category == null || category.isEmpty()) ? "MCP" : category;
+        final String note = (comment == null) ? "" : comment;
+        String err = runInTransaction(program, "Set bookmark", () -> {
+            program.getBookmarkManager().setBookmark(a, BookmarkType.NOTE, cat, note);
+        });
+        return err != null ? err : "Bookmark set at " + addr;
+    }
+
+    private String listBookmarks(String filter, int offset, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        List<String> lines = new ArrayList<>();
+        Iterator<Bookmark> it = program.getBookmarkManager().getBookmarksIterator();
+        while (it.hasNext()) {
+            Bookmark b = it.next();
+            String line = String.format("%s [%s/%s] %s",
+                b.getAddress(), b.getTypeString(), b.getCategory(), b.getComment());
+            if (filter == null || filter.isEmpty()
+                    || line.toLowerCase().contains(filter.toLowerCase())) {
+                lines.add(line);
+            }
+        }
+        return paginateList(lines, offset, limit);
+    }
+
+    private String defineStruct(String cDecl) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (cDecl == null || cDecl.isEmpty()) return "Error: c_declaration is required";
+        DataTypeManager dtm = program.getDataTypeManager();
+        final String[] result = {null};
+        String err = runInTransaction(program, "Define struct", () -> {
+            CParser parser = new CParser(dtm);
+            DataType dt = parser.parse(cDecl);
+            if (dt == null) throw new Exception("parser returned no type");
+            DataType added = dtm.addDataType(dt, DataTypeConflictHandler.REPLACE_HANDLER);
+            result[0] = added.getPathName();
+        });
+        return err != null ? err : "Defined type " + result[0];
+    }
+
+    // ----- Priority 5: persistence -----
+
+    private String saveProgram() {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        try {
+            DomainFile df = program.getDomainFile();
+            if (df == null) return "Error: no domain file";
+            df.save(new ConsoleTaskMonitor());
+            return "Saved " + df.getPathname();
+        } catch (Exception e) {
+            return "Error saving program: " + e.getMessage();
+        }
     }
 
     // ----------------------------------------------------------------------------------

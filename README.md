@@ -21,6 +21,25 @@ MCP Server + Ghidra Plugin
 - Automatically rename methods and data
 - List methods, classes, imports, and exports
 
+## Fork additions (firmware RE)
+
+This fork targets **Ghidra 12.1.3** (builds with JDK 21) and adds tools for
+getting from raw bytes to functions unattended — the controls that previously
+lived only in the Ghidra GUI. See `WISHLIST_PLAN.md` for the motivation.
+
+- **Code definition & analysis**: `set_register_context` (set a processor
+  context register over a range — the key to VLE/Thumb/MIPS16 decoding),
+  `disassemble` (force disassembly of a range), `create_function`,
+  `delete_function`, `clear_code`, `auto_analyze` / `run_analysis`,
+  `analysis_status`, `define_data`.
+- **Program setup & sanity**: `import_program` (import a raw/headerless binary
+  with an explicit language and base), `list_languages`, `program_info`
+  (segment map plus an optional decode sanity check to catch a wrong-arch DB).
+- **Search & raw bytes**: `read_bytes`, `search_bytes` (with mask), `get_string`.
+- **Annotation & scale**: paginated/filterable `list_functions`,
+  `decompile_many`, `set_bookmark`, `list_bookmarks`, `define_struct`.
+- **Persistence**: `save_program`.
+
 # Installation
 
 ## Prerequisites
@@ -99,6 +118,8 @@ Another MCP client that supports multiple models on the backend is [5ire](https:
 3. Command: `python /ABSOLUTE_PATH_TO/bridge_mcp_ghidra.py`
 
 # Building from Source
+Requires **JDK 21** (Ghidra 12.x jars are compiled for Java 21) and Maven.
+
 1. Copy the following files from your Ghidra directory to this project's `lib/` directory:
 - `Ghidra/Features/Base/lib/Base.jar`
 - `Ghidra/Features/Decompiler/lib/Decompiler.jar`
@@ -108,9 +129,14 @@ Another MCP client that supports multiple models on the backend is [5ire](https:
 - `Ghidra/Framework/SoftwareModeling/lib/SoftwareModeling.jar`
 - `Ghidra/Framework/Utility/lib/Utility.jar`
 - `Ghidra/Framework/Gui/lib/Gui.jar`
+- `Ghidra/Framework/FileSystem/lib/FileSystem.jar`
 2. Build with Maven by running:
 
 `mvn clean package assembly:single`
+
+The build is pinned to Ghidra 12.1.3 in `pom.xml`. To target a different Ghidra
+version, update the `<version>` tags in `pom.xml`, the `version`/`ghidraVersion`
+in `src/main/resources/extension.properties`, and copy the matching jars.
 
 The generated zip file includes the built Ghidra plugin and its resources. These files are required for Ghidra to recognize the new extension.
 
