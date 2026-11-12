@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "ghidra": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "REPLACE_WITH_FOLDER_CONTAINING_bridge_mcp_ghidra.py",
+        "run",
+        "--with",
+        "mcp==1.5.0",
+        "--with",
+        "requests==2.32.3",
+        "python",
+        "bridge_mcp_ghidra.py",
+        "--ghidra-server",
+        "http://127.0.0.1:8080/"
+      ],
+      "env": {}
+    }
+  }
+}
